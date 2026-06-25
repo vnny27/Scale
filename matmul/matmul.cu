@@ -30,15 +30,13 @@ struct VersionConfig {
 #define BENCHMARK_ITERATIONS 10
 
 
-// TODO: define kernel function
-// hint! __global__ void matmul() { }
 #define TILE 64
 #define THREAD_TILE 4
 #define K_TILE (TILE / 2)
 #define BLOCK_THREADS (TILE / THREAD_TILE)
 __global__ void matmul(float *A, float *B, float *C,int M, int N, int K) {
     __shared__ float subtileA[TILE][K_TILE];
-    __shared__ float subtileB[K_TILE][TILE];
+    __shared__ float subtileB[K_TILE][BLOCK_THREADS][THREAD_TILE + 2];
 
     int bx = blockIdx.x;
     int by = blockIdx.y;
@@ -46,7 +44,7 @@ __global__ void matmul(float *A, float *B, float *C,int M, int N, int K) {
     int ty = threadIdx.y;
 
     int row_base = TILE * by + ty * THREAD_TILE;
-    int col_base = TILE * bx + tx * THREAD_TILE;
+    int col_base = TILE * bx + tx;
     int linear_tid = ty * BLOCK_THREADS + tx;
     int block_threads = BLOCK_THREADS * BLOCK_THREADS;
 
@@ -70,11 +68,13 @@ __global__ void matmul(float *A, float *B, float *C,int M, int N, int K) {
             int col = idx % TILE;
             int global_row = t + row;
             int global_col = TILE * bx + col;
+            int shared_tx = col % BLOCK_THREADS;
+            int shared_j = col / BLOCK_THREADS;
 
             if (global_row < K && global_col < N)
-                subtileB[row][col] = B[global_row * N + global_col];
+                subtileB[row][shared_tx][shared_j] = B[global_row * N + global_col];
             else
-                subtileB[row][col] = 0.0f;
+                subtileB[row][shared_tx][shared_j] = 0.0f;
         }
 
         __syncthreads();
@@ -90,7 +90,7 @@ __global__ void matmul(float *A, float *B, float *C,int M, int N, int K) {
 
             #pragma unroll
             for (int j = 0; j < THREAD_TILE; ++j) {
-                b_val[j] = subtileB[k][tx * THREAD_TILE + j];
+                b_val[j] = subtileB[k][tx][j];
             }
 
             #pragma unroll
@@ -110,7 +110,7 @@ __global__ void matmul(float *A, float *B, float *C,int M, int N, int K) {
         if (row < M) {
             #pragma unroll
             for (int j = 0; j < THREAD_TILE; ++j) {
-                int col = col_base + j;
+                int col = col_base + j * BLOCK_THREADS;
                 if (col < N) {
                     C[row * N + col] = c_val[i][j];
                 }
@@ -278,7 +278,6 @@ int main(int argc, char* argv[]) {
     fill_random(A_host, A_size);
     fill_random(B_host, B_size);
 
-    // TODO: Allocate device memory and copy A_host, B_host to device memory
     float *A_dev, *B_dev, *C_dev, *C_cublas_dev = nullptr;
     cudaMalloc((void **)&A_dev, A_size * sizeof(float));
     cudaMalloc((void **)&B_dev, B_size * sizeof(float));
@@ -295,7 +294,6 @@ int main(int argc, char* argv[]) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    // TODO: launch kernel -> hint! matmul<<<dimGrid, dimBlock>>>( device memory );
     dim3 dimGrid((config.N + TILE - 1) / TILE, (config.M + TILE - 1) / TILE, 1);
     dim3 dimBlock(BLOCK_THREADS, BLOCK_THREADS, 1);
     for (int i = 0; i < WARMUP_ITERATIONS; ++i) {
@@ -405,7 +403,6 @@ int main(int argc, char* argv[]) {
     
 
     if (verify && launchErr == cudaSuccess && syncErr == cudaSuccess) {
-        // TODO: copy back kernel result to C_host
         cudaMemcpy(C_host, C_dev, C_size * sizeof(float), cudaMemcpyDeviceToHost);
 
         float* C_answer = cpu(A_host, B_host, A_height, A_width, B_width);
