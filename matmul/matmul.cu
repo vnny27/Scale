@@ -30,73 +30,106 @@ struct VersionConfig {
 #define BENCHMARK_ITERATIONS 10
 
 
-#define TILE 64
-#define THREAD_TILE 4
-#define K_TILE (TILE / 2)
-#define BLOCK_THREADS (TILE / THREAD_TILE)
-__global__ void matmul(float *A, float *B, float *C,int M, int N, int K) {
-    __shared__ float subtileA[TILE][K_TILE];
-    __shared__ float subtileB[K_TILE][BLOCK_THREADS][THREAD_TILE + 2];
+#define MATRIX_M 4096
+#define MATRIX_N 4096
+#define MATRIX_K 4096
+#define BLOCK_M 128
+#define BLOCK_N 128
+#define BLOCK_K 8
+#define THREAD_TILE_M 8
+#define THREAD_TILE_N 8
+#define WARPS_M 4
+#define WARPS_N 2
+#define WARP_THREADS 32
+#define WARP_TILE_M (BLOCK_M / WARPS_M)
+#define WARP_TILE_N (BLOCK_N / WARPS_N)
+#define LANES_M (WARP_TILE_M / THREAD_TILE_M)
+#define LANES_N (WARP_TILE_N / THREAD_TILE_N)
+#define BLOCK_THREADS (WARPS_M * WARPS_N * WARP_THREADS)
+#define FLOAT4_WIDTH 4
+static_assert(BLOCK_M % FLOAT4_WIDTH == 0, "BLOCK_M must be divisible by FLOAT4_WIDTH");
+static_assert(BLOCK_N % FLOAT4_WIDTH == 0, "BLOCK_N must be divisible by FLOAT4_WIDTH");
+static_assert(BLOCK_K % FLOAT4_WIDTH == 0, "BLOCK_K must be divisible by FLOAT4_WIDTH");
+static_assert(THREAD_TILE_M % FLOAT4_WIDTH == 0, "THREAD_TILE_M must be divisible by FLOAT4_WIDTH");
+static_assert(THREAD_TILE_N % FLOAT4_WIDTH == 0, "THREAD_TILE_N must be divisible by FLOAT4_WIDTH");
+
+__global__ void matmul(
+    const float *__restrict__ A,
+    const float *__restrict__ B,
+    float *__restrict__ C) {
+    __shared__ __align__(16) float subtileA[BLOCK_K][BLOCK_M];
+    __shared__ __align__(16) float subtileB[BLOCK_K][BLOCK_N];
 
     int bx = blockIdx.x;
     int by = blockIdx.y;
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
+    int linear_tid = threadIdx.x;
 
-    int row_base = TILE * by + ty * THREAD_TILE;
-    int col_base = TILE * bx + tx;
-    int linear_tid = ty * BLOCK_THREADS + tx;
-    int block_threads = BLOCK_THREADS * BLOCK_THREADS;
+    int warp_id = linear_tid / WARP_THREADS;
+    int lane_id = linear_tid % WARP_THREADS;
+    int warp_m = warp_id / WARPS_N;
+    int warp_n = warp_id % WARPS_N;
+    int lane_m = lane_id / LANES_N;
+    int lane_n = lane_id % LANES_N;
 
-    float c_val[THREAD_TILE][THREAD_TILE] = {0.0f};
+    float c_val[THREAD_TILE_M][THREAD_TILE_N] = {0.0f};
 
-    for (int t = 0; t < K; t += K_TILE){
-        for (int idx = linear_tid; idx < TILE * K_TILE; idx += block_threads) {
-            int row = idx / K_TILE;
-            int col = idx % K_TILE;
-            int global_row = TILE * by + row;
+    int local_row_base = warp_m * WARP_TILE_M + lane_m * THREAD_TILE_M;
+    int local_col_base = warp_n * WARP_TILE_N + lane_n * THREAD_TILE_N;
+    int row_base = BLOCK_M * by + local_row_base;
+    int col_base = BLOCK_N * bx + local_col_base;
+
+    for (int t = 0; t < MATRIX_K; t += BLOCK_K){
+        for (int idx = linear_tid; idx < BLOCK_M * (BLOCK_K / FLOAT4_WIDTH); idx += BLOCK_THREADS) {
+            int row = idx / (BLOCK_K / FLOAT4_WIDTH);
+            int col = (idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+            int global_row = BLOCK_M * by + row;
             int global_col = t + col;
 
-            if (global_row < M && global_col < K)
-                subtileA[row][col] = A[global_row * K + global_col];
-            else
-                subtileA[row][col] = 0.0f;
+            float4 a_vec = reinterpret_cast<const float4 *>(&A[global_row * MATRIX_K + global_col])[0];
+            subtileA[col + 0][row] = a_vec.x;
+            subtileA[col + 1][row] = a_vec.y;
+            subtileA[col + 2][row] = a_vec.z;
+            subtileA[col + 3][row] = a_vec.w;
         }
 
-        for (int idx = linear_tid; idx < K_TILE * TILE; idx += block_threads) {
-            int row = idx / TILE;
-            int col = idx % TILE;
+        for (int idx = linear_tid; idx < BLOCK_K * (BLOCK_N / FLOAT4_WIDTH); idx += BLOCK_THREADS) {
+            int row = idx / (BLOCK_N / FLOAT4_WIDTH);
+            int col = (idx % (BLOCK_N / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
             int global_row = t + row;
-            int global_col = TILE * bx + col;
-            int shared_tx = col % BLOCK_THREADS;
-            int shared_j = col / BLOCK_THREADS;
+            int global_col = BLOCK_N * bx + col;
 
-            if (global_row < K && global_col < N)
-                subtileB[row][shared_tx][shared_j] = B[global_row * N + global_col];
-            else
-                subtileB[row][shared_tx][shared_j] = 0.0f;
+            float4 b_vec = reinterpret_cast<const float4 *>(&B[global_row * MATRIX_N + global_col])[0];
+            reinterpret_cast<float4 *>(&subtileB[row][col])[0] = b_vec;
         }
 
         __syncthreads();
 
-        for (int k = 0; k < K_TILE; k++){
-            float a_val[THREAD_TILE];
-            float b_val[THREAD_TILE];
+        for (int k = 0; k < BLOCK_K; k++){
+            float a_val[THREAD_TILE_M];
+            float b_val[THREAD_TILE_N];
 
             #pragma unroll
-            for (int i = 0; i < THREAD_TILE; ++i) {
-                a_val[i] = subtileA[ty * THREAD_TILE + i][k];
+            for (int i = 0; i < THREAD_TILE_M; i += FLOAT4_WIDTH) {
+                float4 a_vec = reinterpret_cast<const float4 *>(&subtileA[k][local_row_base + i])[0];
+                a_val[i + 0] = a_vec.x;
+                a_val[i + 1] = a_vec.y;
+                a_val[i + 2] = a_vec.z;
+                a_val[i + 3] = a_vec.w;
             }
 
             #pragma unroll
-            for (int j = 0; j < THREAD_TILE; ++j) {
-                b_val[j] = subtileB[k][tx][j];
+            for (int j = 0; j < THREAD_TILE_N; j += FLOAT4_WIDTH) {
+                float4 b_vec = reinterpret_cast<const float4 *>(&subtileB[k][local_col_base + j])[0];
+                b_val[j + 0] = b_vec.x;
+                b_val[j + 1] = b_vec.y;
+                b_val[j + 2] = b_vec.z;
+                b_val[j + 3] = b_vec.w;
             }
 
             #pragma unroll
-            for (int i = 0; i < THREAD_TILE; ++i) {
+            for (int i = 0; i < THREAD_TILE_M; ++i) {
                 #pragma unroll
-                for (int j = 0; j < THREAD_TILE; ++j) {
+                for (int j = 0; j < THREAD_TILE_N; ++j) {
                     c_val[i][j] += a_val[i] * b_val[j];
                 }
             }
@@ -105,17 +138,13 @@ __global__ void matmul(float *A, float *B, float *C,int M, int N, int K) {
     }
 
     #pragma unroll
-    for (int i = 0; i < THREAD_TILE; ++i) {
+    for (int i = 0; i < THREAD_TILE_M; ++i) {
         int row = row_base + i;
-        if (row < M) {
-            #pragma unroll
-            for (int j = 0; j < THREAD_TILE; ++j) {
-                int col = col_base + j * BLOCK_THREADS;
-                if (col < N) {
-                    C[row * N + col] = c_val[i][j];
-                }
-            }
-        }
+        int c_idx = row * MATRIX_N + col_base;
+        float4 c_vec0 = {c_val[i][0], c_val[i][1], c_val[i][2], c_val[i][3]};
+        float4 c_vec1 = {c_val[i][4], c_val[i][5], c_val[i][6], c_val[i][7]};
+        reinterpret_cast<float4 *>(&C[c_idx])[0] = c_vec0;
+        reinterpret_cast<float4 *>(&C[c_idx + FLOAT4_WIDTH])[0] = c_vec1;
     }
 }
 
@@ -252,7 +281,7 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    VersionConfig config = {4096, 4096, 4096};
+    VersionConfig config = {MATRIX_M, MATRIX_K, MATRIX_N};
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "----------------Mat Mul----------------\n";
     std::cout << "Verification: " << (verify ? "on" : "off") << "\n";
@@ -260,7 +289,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Warmup iterations: " << WARMUP_ITERATIONS << "\n";
     std::cout << "Benchmark iterations: " << BENCHMARK_ITERATIONS << "\n";
 
-    // Random input matrix
     int A_height = config.M;
     int A_width = config.K;
     int B_height = config.K;
@@ -294,17 +322,17 @@ int main(int argc, char* argv[]) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    dim3 dimGrid((config.N + TILE - 1) / TILE, (config.M + TILE - 1) / TILE, 1);
-    dim3 dimBlock(BLOCK_THREADS, BLOCK_THREADS, 1);
+    dim3 dimGrid(MATRIX_N / BLOCK_N, MATRIX_M / BLOCK_M, 1);
+    dim3 dimBlock(BLOCK_THREADS, 1, 1);
     for (int i = 0; i < WARMUP_ITERATIONS; ++i) {
-        matmul<<<dimGrid, dimBlock>>>(A_dev, B_dev, C_dev, config.M, config.N, config.K);
+        matmul<<<dimGrid, dimBlock>>>(A_dev, B_dev, C_dev);
     }
     cudaDeviceSynchronize();
 
     profiler_range_push("custom_matmul");
     cudaEventRecord(start); 
     for (int i = 0; i < BENCHMARK_ITERATIONS; ++i) {
-        matmul<<<dimGrid, dimBlock>>>(A_dev, B_dev, C_dev, config.M, config.N, config.K);
+        matmul<<<dimGrid, dimBlock>>>(A_dev, B_dev, C_dev);
     }
     cudaEventRecord(stop);
 
