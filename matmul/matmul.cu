@@ -55,16 +55,16 @@ static_assert(THREAD_TILE_N % FLOAT4_WIDTH == 0, "THREAD_TILE_N must be divisibl
 static_assert(THREAD_TILE_M == 8, "This unrolled accumulator path expects THREAD_TILE_M == 8");
 static_assert(THREAD_TILE_N == 8, "This unrolled accumulator path expects THREAD_TILE_N == 8");
 
-#define FMA_ACCUM_ROW(a, b0, b1, c0, c1) \
+#define FMA_ACCUM_COL(a0, a1, b, c0, c1) \
     do { \
-        (c0).x = fmaf((a), (b0).x, (c0).x); \
-        (c0).y = fmaf((a), (b0).y, (c0).y); \
-        (c0).z = fmaf((a), (b0).z, (c0).z); \
-        (c0).w = fmaf((a), (b0).w, (c0).w); \
-        (c1).x = fmaf((a), (b1).x, (c1).x); \
-        (c1).y = fmaf((a), (b1).y, (c1).y); \
-        (c1).z = fmaf((a), (b1).z, (c1).z); \
-        (c1).w = fmaf((a), (b1).w, (c1).w); \
+        (c0).x = fmaf((a0).x, (b), (c0).x); \
+        (c0).y = fmaf((a0).y, (b), (c0).y); \
+        (c0).z = fmaf((a0).z, (b), (c0).z); \
+        (c0).w = fmaf((a0).w, (b), (c0).w); \
+        (c1).x = fmaf((a1).x, (b), (c1).x); \
+        (c1).y = fmaf((a1).y, (b), (c1).y); \
+        (c1).z = fmaf((a1).z, (b), (c1).z); \
+        (c1).w = fmaf((a1).w, (b), (c1).w); \
     } while (0)
 
 __global__ void matmul(
@@ -76,17 +76,17 @@ __global__ void matmul(
 
     int bx = blockIdx.x;
     int by = blockIdx.y;
-    int linear_tid = threadIdx.x;
+    int tid = threadIdx.x;
 
-    int warp_id = linear_tid / WARP_THREADS;
-    int lane_id = linear_tid % WARP_THREADS;
+    int warp_id = tid / WARP_THREADS;
+    int lane_id = tid % WARP_THREADS;
     int warp_m = warp_id / WARPS_N;
     int warp_n = warp_id % WARPS_N;
     int lane_m = lane_id % LANES_M;
     int lane_n = lane_id / LANES_M;
 
-    float4 c0[THREAD_TILE_M] = {};
-    float4 c1[THREAD_TILE_M] = {};
+    float4 c0[THREAD_TILE_N] = {};
+    float4 c1[THREAD_TILE_N] = {};
 
     int local_row_base = warp_m * WARP_TILE_M + lane_m * THREAD_TILE_M;
     int local_col_base = warp_n * WARP_TILE_N + lane_n * THREAD_TILE_N;
@@ -94,27 +94,27 @@ __global__ void matmul(
     int col_base = BLOCK_N * bx + local_col_base;
 
     for (int t = 0; t < MATRIX_K; t += BLOCK_K){
-        for (int idx = linear_tid; idx < BLOCK_M * (BLOCK_K / FLOAT4_WIDTH); idx += BLOCK_THREADS) {
-            int row = idx / (BLOCK_K / FLOAT4_WIDTH);
-            int col = (idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+        for (int idx = tid; idx < BLOCK_K * (BLOCK_M / FLOAT4_WIDTH); idx += BLOCK_THREADS) {
+            int row = (idx % (BLOCK_M / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+            int col = idx / (BLOCK_M / FLOAT4_WIDTH);
             int global_row = BLOCK_M * by + row;
             int global_col = t + col;
 
-            float4 a_vec = reinterpret_cast<const float4 *>(&A[global_row * MATRIX_K + global_col])[0];
-            subtileA[col + 0][row] = a_vec.x;
-            subtileA[col + 1][row] = a_vec.y;
-            subtileA[col + 2][row] = a_vec.z;
-            subtileA[col + 3][row] = a_vec.w;
+            float4 a_vec = reinterpret_cast<const float4 *>(&A[global_col * MATRIX_M + global_row])[0];
+            reinterpret_cast<float4 *>(&subtileA[col][row])[0] = a_vec;
         }
 
-        for (int idx = linear_tid; idx < BLOCK_K * (BLOCK_N / FLOAT4_WIDTH); idx += BLOCK_THREADS) {
-            int row = idx / (BLOCK_N / FLOAT4_WIDTH);
-            int col = (idx % (BLOCK_N / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+        for (int idx = tid; idx < BLOCK_N * (BLOCK_K / FLOAT4_WIDTH); idx += BLOCK_THREADS) {
+            int row = (idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+            int col = idx / (BLOCK_K / FLOAT4_WIDTH);
             int global_row = t + row;
             int global_col = BLOCK_N * bx + col;
 
-            float4 b_vec = reinterpret_cast<const float4 *>(&B[global_row * MATRIX_N + global_col])[0];
-            reinterpret_cast<float4 *>(&subtileB[row][col])[0] = b_vec;
+            float4 b_vec = reinterpret_cast<const float4 *>(&B[global_col * MATRIX_K + global_row])[0];
+            subtileB[row + 0][col] = b_vec.x;
+            subtileB[row + 1][col] = b_vec.y;
+            subtileB[row + 2][col] = b_vec.z;
+            subtileB[row + 3][col] = b_vec.w;
         }
 
         __syncthreads();
@@ -125,28 +125,28 @@ __global__ void matmul(
             float4 b0 = reinterpret_cast<const float4 *>(&subtileB[k][local_col_base + 0])[0];
             float4 b1 = reinterpret_cast<const float4 *>(&subtileB[k][local_col_base + 4])[0];
 
-            FMA_ACCUM_ROW(a0.x, b0, b1, c0[0], c1[0]);
-            FMA_ACCUM_ROW(a0.y, b0, b1, c0[1], c1[1]);
-            FMA_ACCUM_ROW(a0.z, b0, b1, c0[2], c1[2]);
-            FMA_ACCUM_ROW(a0.w, b0, b1, c0[3], c1[3]);
-            FMA_ACCUM_ROW(a1.x, b0, b1, c0[4], c1[4]);
-            FMA_ACCUM_ROW(a1.y, b0, b1, c0[5], c1[5]);
-            FMA_ACCUM_ROW(a1.z, b0, b1, c0[6], c1[6]);
-            FMA_ACCUM_ROW(a1.w, b0, b1, c0[7], c1[7]);
+            FMA_ACCUM_COL(a0, a1, b0.x, c0[0], c1[0]);
+            FMA_ACCUM_COL(a0, a1, b0.y, c0[1], c1[1]);
+            FMA_ACCUM_COL(a0, a1, b0.z, c0[2], c1[2]);
+            FMA_ACCUM_COL(a0, a1, b0.w, c0[3], c1[3]);
+            FMA_ACCUM_COL(a0, a1, b1.x, c0[4], c1[4]);
+            FMA_ACCUM_COL(a0, a1, b1.y, c0[5], c1[5]);
+            FMA_ACCUM_COL(a0, a1, b1.z, c0[6], c1[6]);
+            FMA_ACCUM_COL(a0, a1, b1.w, c0[7], c1[7]);
         }
         __syncthreads();
     }
 
     #pragma unroll
-    for (int i = 0; i < THREAD_TILE_M; ++i) {
-        int row = row_base + i;
-        int c_idx = row * MATRIX_N + col_base;
-        reinterpret_cast<float4 *>(&C[c_idx])[0] = c0[i];
-        reinterpret_cast<float4 *>(&C[c_idx + FLOAT4_WIDTH])[0] = c1[i];
+    for (int i = 0; i < THREAD_TILE_N; ++i) {
+        int col = col_base + i;
+        int r_idx = col * MATRIX_M + row_base;
+        reinterpret_cast<float4 *>(&C[r_idx])[0] = c0[i];
+        reinterpret_cast<float4 *>(&C[r_idx + FLOAT4_WIDTH])[0] = c1[i];
     }
 }
 
-#undef FMA_ACCUM_ROW
+#undef FMA_ACCUM_COL
 
 void fill_random(float* arr, size_t size) {
     std::mt19937 gen(SEED);
@@ -234,11 +234,11 @@ float* cpu(const float* A, const float* B, int A_height, int A_width, int B_widt
 
     omp_set_num_threads(6);
     #pragma omp parallel for
-    for (int i = 0; i < A_height; ++i) {
+    for (int j = 0; j < B_width; ++j) {
         for (int k = 0; k < A_width; ++k) {
-            float Aik = A[i * A_width + k];
-            for (int j = 0; j < B_width; ++j) {
-                C[i * B_width + j] += Aik * B[k * B_width + j];
+            float Bkj = B[k + j * A_width];
+            for (int i = 0; i < A_height; ++i) {
+                C[i + j * A_height] += A[i + k * A_height] * Bkj;
             }
         }
     }
@@ -372,12 +372,12 @@ int main(int argc, char* argv[]) {
                 cublasErr = cublasSgemm(
                     handle,
                     CUBLAS_OP_N, CUBLAS_OP_N,
-                    B_width, A_height, A_width,
+                    A_height, B_width, A_width,
                     &alpha,
-                    B_dev, B_width,
-                    A_dev, A_width,
+                    A_dev, A_height,
+                    B_dev, A_width,
                     &beta,
-                    C_cublas_dev, B_width);
+                    C_cublas_dev, A_height);
             }
             cublasSyncErr = cudaDeviceSynchronize();
 
@@ -388,17 +388,16 @@ int main(int argc, char* argv[]) {
             if (cublasErr == CUBLAS_STATUS_SUCCESS && cublasSyncErr == cudaSuccess) {
                 profiler_range_push("cublas_sgemm");
                 cudaEventRecord(cublas_start);
-                // Row-major C = A * B is column-major C^T = B^T * A^T.
                 for (int i = 0; i < BENCHMARK_ITERATIONS && cublasErr == CUBLAS_STATUS_SUCCESS; ++i) {
                     cublasErr = cublasSgemm(
                         handle,
                         CUBLAS_OP_N, CUBLAS_OP_N,
-                        B_width, A_height, A_width,
+                        A_height, B_width, A_width,
                         &alpha,
-                        B_dev, B_width,
-                        A_dev, A_width,
+                        A_dev, A_height,
+                        B_dev, A_width,
                         &beta,
-                        C_cublas_dev, B_width);
+                        C_cublas_dev, A_height);
                 }
                 cudaEventRecord(cublas_stop);
 
