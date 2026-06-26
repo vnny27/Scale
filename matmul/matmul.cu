@@ -82,8 +82,8 @@ __global__ void matmul(
     int lane_id = linear_tid % WARP_THREADS;
     int warp_m = warp_id / WARPS_N;
     int warp_n = warp_id % WARPS_N;
-    int lane_m = lane_id / LANES_N;
-    int lane_n = lane_id % LANES_N;
+    int lane_m = lane_id % LANES_M;
+    int lane_n = lane_id / LANES_M;
 
     float4 c0[THREAD_TILE_M] = {};
     float4 c1[THREAD_TILE_M] = {};
