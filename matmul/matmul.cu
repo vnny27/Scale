@@ -35,7 +35,7 @@ struct VersionConfig {
 #define MATRIX_K 4096
 #define BLOCK_M 128
 #define BLOCK_N 128
-#define BLOCK_K 8
+#define BLOCK_K 16
 #define THREAD_TILE_M 8
 #define THREAD_TILE_N 8
 #define WARPS_M 4
@@ -52,6 +52,20 @@ static_assert(BLOCK_N % FLOAT4_WIDTH == 0, "BLOCK_N must be divisible by FLOAT4_
 static_assert(BLOCK_K % FLOAT4_WIDTH == 0, "BLOCK_K must be divisible by FLOAT4_WIDTH");
 static_assert(THREAD_TILE_M % FLOAT4_WIDTH == 0, "THREAD_TILE_M must be divisible by FLOAT4_WIDTH");
 static_assert(THREAD_TILE_N % FLOAT4_WIDTH == 0, "THREAD_TILE_N must be divisible by FLOAT4_WIDTH");
+static_assert(THREAD_TILE_M == 8, "This unrolled accumulator path expects THREAD_TILE_M == 8");
+static_assert(THREAD_TILE_N == 8, "This unrolled accumulator path expects THREAD_TILE_N == 8");
+
+#define FMA_ACCUM_ROW(a, b0, b1, c0, c1) \
+    do { \
+        (c0).x = fmaf((a), (b0).x, (c0).x); \
+        (c0).y = fmaf((a), (b0).y, (c0).y); \
+        (c0).z = fmaf((a), (b0).z, (c0).z); \
+        (c0).w = fmaf((a), (b0).w, (c0).w); \
+        (c1).x = fmaf((a), (b1).x, (c1).x); \
+        (c1).y = fmaf((a), (b1).y, (c1).y); \
+        (c1).z = fmaf((a), (b1).z, (c1).z); \
+        (c1).w = fmaf((a), (b1).w, (c1).w); \
+    } while (0)
 
 __global__ void matmul(
     const float *__restrict__ A,
@@ -71,7 +85,8 @@ __global__ void matmul(
     int lane_m = lane_id / LANES_N;
     int lane_n = lane_id % LANES_N;
 
-    float c_val[THREAD_TILE_M][THREAD_TILE_N] = {0.0f};
+    float4 c0[THREAD_TILE_M] = {};
+    float4 c1[THREAD_TILE_M] = {};
 
     int local_row_base = warp_m * WARP_TILE_M + lane_m * THREAD_TILE_M;
     int local_col_base = warp_n * WARP_TILE_N + lane_n * THREAD_TILE_N;
@@ -104,35 +119,20 @@ __global__ void matmul(
 
         __syncthreads();
 
-        for (int k = 0; k < BLOCK_K; k++){
-            float a_val[THREAD_TILE_M];
-            float b_val[THREAD_TILE_N];
+        for (int k = 0; k < BLOCK_K; ++k) {
+            float4 a0 = reinterpret_cast<const float4 *>(&subtileA[k][local_row_base + 0])[0];
+            float4 a1 = reinterpret_cast<const float4 *>(&subtileA[k][local_row_base + 4])[0];
+            float4 b0 = reinterpret_cast<const float4 *>(&subtileB[k][local_col_base + 0])[0];
+            float4 b1 = reinterpret_cast<const float4 *>(&subtileB[k][local_col_base + 4])[0];
 
-            #pragma unroll
-            for (int i = 0; i < THREAD_TILE_M; i += FLOAT4_WIDTH) {
-                float4 a_vec = reinterpret_cast<const float4 *>(&subtileA[k][local_row_base + i])[0];
-                a_val[i + 0] = a_vec.x;
-                a_val[i + 1] = a_vec.y;
-                a_val[i + 2] = a_vec.z;
-                a_val[i + 3] = a_vec.w;
-            }
-
-            #pragma unroll
-            for (int j = 0; j < THREAD_TILE_N; j += FLOAT4_WIDTH) {
-                float4 b_vec = reinterpret_cast<const float4 *>(&subtileB[k][local_col_base + j])[0];
-                b_val[j + 0] = b_vec.x;
-                b_val[j + 1] = b_vec.y;
-                b_val[j + 2] = b_vec.z;
-                b_val[j + 3] = b_vec.w;
-            }
-
-            #pragma unroll
-            for (int i = 0; i < THREAD_TILE_M; ++i) {
-                #pragma unroll
-                for (int j = 0; j < THREAD_TILE_N; ++j) {
-                    c_val[i][j] += a_val[i] * b_val[j];
-                }
-            }
+            FMA_ACCUM_ROW(a0.x, b0, b1, c0[0], c1[0]);
+            FMA_ACCUM_ROW(a0.y, b0, b1, c0[1], c1[1]);
+            FMA_ACCUM_ROW(a0.z, b0, b1, c0[2], c1[2]);
+            FMA_ACCUM_ROW(a0.w, b0, b1, c0[3], c1[3]);
+            FMA_ACCUM_ROW(a1.x, b0, b1, c0[4], c1[4]);
+            FMA_ACCUM_ROW(a1.y, b0, b1, c0[5], c1[5]);
+            FMA_ACCUM_ROW(a1.z, b0, b1, c0[6], c1[6]);
+            FMA_ACCUM_ROW(a1.w, b0, b1, c0[7], c1[7]);
         }
         __syncthreads();
     }
@@ -141,12 +141,12 @@ __global__ void matmul(
     for (int i = 0; i < THREAD_TILE_M; ++i) {
         int row = row_base + i;
         int c_idx = row * MATRIX_N + col_base;
-        float4 c_vec0 = {c_val[i][0], c_val[i][1], c_val[i][2], c_val[i][3]};
-        float4 c_vec1 = {c_val[i][4], c_val[i][5], c_val[i][6], c_val[i][7]};
-        reinterpret_cast<float4 *>(&C[c_idx])[0] = c_vec0;
-        reinterpret_cast<float4 *>(&C[c_idx + FLOAT4_WIDTH])[0] = c_vec1;
+        reinterpret_cast<float4 *>(&C[c_idx])[0] = c0[i];
+        reinterpret_cast<float4 *>(&C[c_idx + FLOAT4_WIDTH])[0] = c1[i];
     }
 }
+
+#undef FMA_ACCUM_ROW
 
 void fill_random(float* arr, size_t size) {
     std::mt19937 gen(SEED);
