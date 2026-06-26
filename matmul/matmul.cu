@@ -47,13 +47,7 @@ struct VersionConfig {
 #define LANES_N (WARP_TILE_N / THREAD_TILE_N)
 #define BLOCK_THREADS (WARPS_M * WARPS_N * WARP_THREADS)
 #define FLOAT4_WIDTH 4
-static_assert(BLOCK_M % FLOAT4_WIDTH == 0, "BLOCK_M must be divisible by FLOAT4_WIDTH");
-static_assert(BLOCK_N % FLOAT4_WIDTH == 0, "BLOCK_N must be divisible by FLOAT4_WIDTH");
-static_assert(BLOCK_K % FLOAT4_WIDTH == 0, "BLOCK_K must be divisible by FLOAT4_WIDTH");
-static_assert(THREAD_TILE_M % FLOAT4_WIDTH == 0, "THREAD_TILE_M must be divisible by FLOAT4_WIDTH");
-static_assert(THREAD_TILE_N % FLOAT4_WIDTH == 0, "THREAD_TILE_N must be divisible by FLOAT4_WIDTH");
-static_assert(THREAD_TILE_M == 8, "This unrolled accumulator path expects THREAD_TILE_M == 8");
-static_assert(THREAD_TILE_N == 8, "This unrolled accumulator path expects THREAD_TILE_N == 8");
+#define PREFETCH_VECS_PER_THREAD (BLOCK_K / 8)
 
 #define FMA_ACCUM_COL(a0, a1, b, c0, c1) \
     do { \
@@ -71,8 +65,8 @@ __global__ void matmul(
     const float *__restrict__ A,
     const float *__restrict__ B,
     float *__restrict__ C) {
-    __shared__ __align__(16) float subtileA[BLOCK_K][BLOCK_M];
-    __shared__ __align__(16) float subtileB[BLOCK_K][BLOCK_N];
+    __shared__ __align__(16) float subtileA[2][BLOCK_K][BLOCK_M];
+    __shared__ __align__(16) float subtileB[2][BLOCK_K][BLOCK_N + 4];
 
     int bx = blockIdx.x;
     int by = blockIdx.y;
@@ -93,37 +87,56 @@ __global__ void matmul(
     int row_base = BLOCK_M * by + local_row_base;
     int col_base = BLOCK_N * bx + local_col_base;
 
-    for (int t = 0; t < MATRIX_K; t += BLOCK_K){
-        for (int idx = tid; idx < BLOCK_K * (BLOCK_M / FLOAT4_WIDTH); idx += BLOCK_THREADS) {
-            int row = (idx % (BLOCK_M / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
-            int col = idx / (BLOCK_M / FLOAT4_WIDTH);
-            int global_row = BLOCK_M * by + row;
-            int global_col = t + col;
+    float4 pref_a[PREFETCH_VECS_PER_THREAD];
+    float4 pref_b[PREFETCH_VECS_PER_THREAD];
 
-            float4 a_vec = reinterpret_cast<const float4 *>(&A[global_col * MATRIX_M + global_row])[0];
-            reinterpret_cast<float4 *>(&subtileA[col][row])[0] = a_vec;
+    for (int load_i = 0; load_i < PREFETCH_VECS_PER_THREAD; ++load_i) {
+        int a_idx = tid + load_i * BLOCK_THREADS;
+        int a_load_row = (a_idx % (BLOCK_M / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+        int a_load_k = a_idx / (BLOCK_M / FLOAT4_WIDTH);
+        int b_idx = tid + load_i * BLOCK_THREADS;
+        int b_load_k = (b_idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+        int b_load_col = b_idx / (BLOCK_K / FLOAT4_WIDTH);
+
+        pref_a[load_i] = reinterpret_cast<const float4 *>(
+            &A[a_load_k * MATRIX_M + BLOCK_M * by + a_load_row])[0];
+        pref_b[load_i] = reinterpret_cast<const float4 *>(
+            &B[(BLOCK_N * bx + b_load_col) * MATRIX_K + b_load_k])[0];
+
+        reinterpret_cast<float4 *>(&subtileA[0][a_load_k][a_load_row])[0] = pref_a[load_i];
+        subtileB[0][b_load_k + 0][b_load_col] = pref_b[load_i].x;
+        subtileB[0][b_load_k + 1][b_load_col] = pref_b[load_i].y;
+        subtileB[0][b_load_k + 2][b_load_col] = pref_b[load_i].z;
+        subtileB[0][b_load_k + 3][b_load_col] = pref_b[load_i].w;
+    }
+    __syncthreads();
+
+    for (int t = 0, read_stage = 0; t < MATRIX_K; t += BLOCK_K, read_stage ^= 1) {
+        int next_t = t + BLOCK_K;
+        bool has_next = next_t < MATRIX_K;
+        int write_stage = read_stage ^ 1;
+
+        if (has_next) {
+            for (int load_i = 0; load_i < PREFETCH_VECS_PER_THREAD; ++load_i) {
+                int a_idx = tid + load_i * BLOCK_THREADS;
+                int a_load_row = (a_idx % (BLOCK_M / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+                int a_load_k = a_idx / (BLOCK_M / FLOAT4_WIDTH);
+                int b_idx = tid + load_i * BLOCK_THREADS;
+                int b_load_k = (b_idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+                int b_load_col = b_idx / (BLOCK_K / FLOAT4_WIDTH);
+
+                pref_a[load_i] = reinterpret_cast<const float4 *>(
+                    &A[(next_t + a_load_k) * MATRIX_M + BLOCK_M * by + a_load_row])[0];
+                pref_b[load_i] = reinterpret_cast<const float4 *>(
+                    &B[(BLOCK_N * bx + b_load_col) * MATRIX_K + next_t + b_load_k])[0];
+            }
         }
-
-        for (int idx = tid; idx < BLOCK_N * (BLOCK_K / FLOAT4_WIDTH); idx += BLOCK_THREADS) {
-            int row = (idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
-            int col = idx / (BLOCK_K / FLOAT4_WIDTH);
-            int global_row = t + row;
-            int global_col = BLOCK_N * bx + col;
-
-            float4 b_vec = reinterpret_cast<const float4 *>(&B[global_col * MATRIX_K + global_row])[0];
-            subtileB[row + 0][col] = b_vec.x;
-            subtileB[row + 1][col] = b_vec.y;
-            subtileB[row + 2][col] = b_vec.z;
-            subtileB[row + 3][col] = b_vec.w;
-        }
-
-        __syncthreads();
 
         for (int k = 0; k < BLOCK_K; ++k) {
-            float4 a0 = reinterpret_cast<const float4 *>(&subtileA[k][local_row_base + 0])[0];
-            float4 a1 = reinterpret_cast<const float4 *>(&subtileA[k][local_row_base + 4])[0];
-            float4 b0 = reinterpret_cast<const float4 *>(&subtileB[k][local_col_base + 0])[0];
-            float4 b1 = reinterpret_cast<const float4 *>(&subtileB[k][local_col_base + 4])[0];
+            float4 a0 = reinterpret_cast<const float4 *>(&subtileA[read_stage][k][local_row_base + 0])[0];
+            float4 a1 = reinterpret_cast<const float4 *>(&subtileA[read_stage][k][local_row_base + 4])[0];
+            float4 b0 = reinterpret_cast<const float4 *>(&subtileB[read_stage][k][local_col_base + 0])[0];
+            float4 b1 = reinterpret_cast<const float4 *>(&subtileB[read_stage][k][local_col_base + 4])[0];
 
             FMA_ACCUM_COL(a0, a1, b0.x, c0[0], c1[0]);
             FMA_ACCUM_COL(a0, a1, b0.y, c0[1], c1[1]);
@@ -134,7 +147,25 @@ __global__ void matmul(
             FMA_ACCUM_COL(a0, a1, b1.z, c0[6], c1[6]);
             FMA_ACCUM_COL(a0, a1, b1.w, c0[7], c1[7]);
         }
-        __syncthreads();
+
+        if (has_next) {
+            #pragma unroll
+            for (int load_i = 0; load_i < PREFETCH_VECS_PER_THREAD; ++load_i) {
+                int a_idx = tid + load_i * BLOCK_THREADS;
+                int a_load_row = (a_idx % (BLOCK_M / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+                int a_load_k = a_idx / (BLOCK_M / FLOAT4_WIDTH);
+                int b_idx = tid + load_i * BLOCK_THREADS;
+                int b_load_k = (b_idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
+                int b_load_col = b_idx / (BLOCK_K / FLOAT4_WIDTH);
+
+                reinterpret_cast<float4 *>(&subtileA[write_stage][a_load_k][a_load_row])[0] = pref_a[load_i];
+                subtileB[write_stage][b_load_k + 0][b_load_col] = pref_b[load_i].x;
+                subtileB[write_stage][b_load_k + 1][b_load_col] = pref_b[load_i].y;
+                subtileB[write_stage][b_load_k + 2][b_load_col] = pref_b[load_i].z;
+                subtileB[write_stage][b_load_k + 3][b_load_col] = pref_b[load_i].w;
+            }
+            __syncthreads();
+        }
     }
 
     #pragma unroll
@@ -366,7 +397,7 @@ int main(int argc, char* argv[]) {
             const float alpha = 1.0f;
             const float beta = 0.0f;
 
-            cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+            cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 
             for (int i = 0; i < WARMUP_ITERATIONS && cublasErr == CUBLAS_STATUS_SUCCESS; ++i) {
                 cublasErr = cublasSgemm(
