@@ -49,6 +49,21 @@ struct VersionConfig {
 #define FLOAT4_WIDTH 4
 #define PREFETCH_VECS_PER_THREAD (BLOCK_K / 8)
 
+__device__ __forceinline__ void cp_async_float4(void *dst, const void *src) {
+    unsigned int smem_addr =
+        static_cast<unsigned int>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::
+                     "r"(smem_addr), "l"(src));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;\n" ::: "memory");
+}
+
 #define FMA_ACCUM_COL(a0, a1, b, c0, c1) \
     do { \
         (c0).x = fmaf((a0).x, (b), (c0).x); \
@@ -87,7 +102,6 @@ __global__ void matmul(
     int row_base = BLOCK_M * by + local_row_base;
     int col_base = BLOCK_N * bx + local_col_base;
 
-    float4 pref_a[PREFETCH_VECS_PER_THREAD];
     float4 pref_b[PREFETCH_VECS_PER_THREAD];
 
     for (int load_i = 0; load_i < PREFETCH_VECS_PER_THREAD; ++load_i) {
@@ -98,17 +112,19 @@ __global__ void matmul(
         int b_load_k = (b_idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
         int b_load_col = b_idx / (BLOCK_K / FLOAT4_WIDTH);
 
-        pref_a[load_i] = reinterpret_cast<const float4 *>(
-            &A[a_load_k * MATRIX_M + BLOCK_M * by + a_load_row])[0];
         pref_b[load_i] = reinterpret_cast<const float4 *>(
             &B[(BLOCK_N * bx + b_load_col) * MATRIX_K + b_load_k])[0];
 
-        reinterpret_cast<float4 *>(&subtileA[0][a_load_k][a_load_row])[0] = pref_a[load_i];
+        cp_async_float4(
+            &subtileA[0][a_load_k][a_load_row],
+            &A[a_load_k * MATRIX_M + BLOCK_M * by + a_load_row]);
         subtileB[0][b_load_k + 0][b_load_col] = pref_b[load_i].x;
         subtileB[0][b_load_k + 1][b_load_col] = pref_b[load_i].y;
         subtileB[0][b_load_k + 2][b_load_col] = pref_b[load_i].z;
         subtileB[0][b_load_k + 3][b_load_col] = pref_b[load_i].w;
     }
+    cp_async_commit();
+    cp_async_wait_all();
     __syncthreads();
 
     for (int t = 0, read_stage = 0; t < MATRIX_K; t += BLOCK_K, read_stage ^= 1) {
@@ -125,11 +141,13 @@ __global__ void matmul(
                 int b_load_k = (b_idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
                 int b_load_col = b_idx / (BLOCK_K / FLOAT4_WIDTH);
 
-                pref_a[load_i] = reinterpret_cast<const float4 *>(
-                    &A[(next_t + a_load_k) * MATRIX_M + BLOCK_M * by + a_load_row])[0];
+                cp_async_float4(
+                    &subtileA[write_stage][a_load_k][a_load_row],
+                    &A[(next_t + a_load_k) * MATRIX_M + BLOCK_M * by + a_load_row]);
                 pref_b[load_i] = reinterpret_cast<const float4 *>(
                     &B[(BLOCK_N * bx + b_load_col) * MATRIX_K + next_t + b_load_k])[0];
             }
+            cp_async_commit();
         }
 
         for (int k = 0; k < BLOCK_K; ++k) {
@@ -151,19 +169,16 @@ __global__ void matmul(
         if (has_next) {
             #pragma unroll
             for (int load_i = 0; load_i < PREFETCH_VECS_PER_THREAD; ++load_i) {
-                int a_idx = tid + load_i * BLOCK_THREADS;
-                int a_load_row = (a_idx % (BLOCK_M / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
-                int a_load_k = a_idx / (BLOCK_M / FLOAT4_WIDTH);
                 int b_idx = tid + load_i * BLOCK_THREADS;
                 int b_load_k = (b_idx % (BLOCK_K / FLOAT4_WIDTH)) * FLOAT4_WIDTH;
                 int b_load_col = b_idx / (BLOCK_K / FLOAT4_WIDTH);
 
-                reinterpret_cast<float4 *>(&subtileA[write_stage][a_load_k][a_load_row])[0] = pref_a[load_i];
                 subtileB[write_stage][b_load_k + 0][b_load_col] = pref_b[load_i].x;
                 subtileB[write_stage][b_load_k + 1][b_load_col] = pref_b[load_i].y;
                 subtileB[write_stage][b_load_k + 2][b_load_col] = pref_b[load_i].z;
                 subtileB[write_stage][b_load_k + 3][b_load_col] = pref_b[load_i].w;
             }
+            cp_async_wait_all();
             __syncthreads();
         }
     }
