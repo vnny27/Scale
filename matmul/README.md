@@ -127,11 +127,11 @@ Use the same structure for each kernel note:
 
 ## Kernel 3 / Interleaved B Layout
 
-- **Goal:** Improve shared-memory access pattern for `B`.
-- **Implementation:** Store/load the shared `B` tile in an interleaved or transposed-friendly layout with padding.
-- **Expected effect:** Reduce bank conflicts and make per-thread `B` reads more regular during the inner loop.
+- **Goal:** Make the row-major `B`/`C` column access pattern more regular across the warp.
+- **Implementation:** Change the per-thread output columns from contiguous columns `tx * THREAD_TILE + j` to interleaved columns `tx + j * BLOCK_THREADS`, and store `B` in shared memory as `subtileB[k][tx][j]` with padding.
+- **Expected effect:** Let threads with the same `j` access neighboring logical columns, improving warp-level regularity for `B` reads and `C` writes while reducing shared-memory bank conflicts.
 - **Result:** `4.382 ms`, `31362.947 GFLOP/s`, `52.4%` of cuBLAS.
-- **Takeaway:** The hot loop is effectively a small outer product, so the `B` values are consumed repeatedly by the register tile. This version shows that a partial/interleaved `B` layout is not enough by itself; the regression points toward a more explicit shared-memory transpose for `B`.
+- **Takeaway:** The idea was reasonable for the row-major kernel: instead of making each thread own four contiguous columns, distribute those columns across the warp so a fixed `j` step maps to neighboring output columns. However, this was only a partial reordering of the `B` tile: it made the warp-level column pattern more regular, but the compute loop still did not get a simple `k`-fixed, column-contiguous view of `B`. This regression made the next step clearer: rather than layering another fix onto the row-major/interleaved layout, reorganize `B` in shared memory around the way the inner outer-product loop actually consumes it.
 
 ## Kernel 4 / Column-Major Transposed Shared B
 
