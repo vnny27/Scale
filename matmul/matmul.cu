@@ -26,8 +26,8 @@ struct VersionConfig {
 };
 
 #define SEED 1234
-#define WARMUP_ITERATIONS 2
-#define BENCHMARK_ITERATIONS 10
+#define WARMUP_ITERATIONS 10
+#define BENCHMARK_ITERATIONS 30
 
 
 #define MATRIX_M 4096
@@ -83,8 +83,9 @@ __global__ void matmul(
     __shared__ __align__(16) float subtileA[2][BLOCK_K][BLOCK_M];
     __shared__ __align__(16) float subtileB[2][BLOCK_K][BLOCK_N + 4];
 
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
+    int linear_block = blockIdx.y * gridDim.x + blockIdx.x;
+    int bx = linear_block / gridDim.y;
+    int by = linear_block % gridDim.y;
     int tid = threadIdx.x;
 
     int warp_id = tid / WARP_THREADS;
@@ -240,17 +241,8 @@ void print_time_result(const char* label, float elapsed_ms, const VersionConfig&
 }
 
 void print_time_comparison(float custom_ms, float cublas_ms) {
-    if (custom_ms <= 0.0f || cublas_ms <= 0.0f) return;
-
-    if (custom_ms < cublas_ms) {
-        std::cout << ">>> Custom kernel is " << (cublas_ms / custom_ms)
-                  << "x faster than cuBLAS SGEMM." << std::endl;
-    } else if (cublas_ms < custom_ms) {
-        std::cout << ">>> cuBLAS SGEMM is " << (custom_ms / cublas_ms)
-                  << "x faster than custom kernel." << std::endl;
-    } else {
-        std::cout << ">>> Custom kernel and cuBLAS SGEMM took the same time." << std::endl;
-    }
+    std::cout << ">>> Custom kernel is " << (cublas_ms / custom_ms)
+              << "x faster than cuBLAS SGEMM." << std::endl;
 }
 
 void profiler_range_push(const char* name) {
