@@ -4,8 +4,6 @@ This directory tracks experiments for optimizing `matmul.cu` and comparing it wi
 
 ## Environment
 
-Fill this in for each benchmark session.
-
 | Item | Value |
 | --- | --- |
 | GPU | NVIDIA GeForce RTX 4090  |
@@ -198,11 +196,11 @@ Use the same structure for each kernel note:
 | Shape class | M | N | K | Custom time (ms) | Custom GFLOP/s | cuBLAS (%) | Purpose |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | Baseline square | 4096 | 4096 | 4096 | 2.456 | 55952.032 | 93.8 | Reference point for existing results |
-| Tall output, deep K | 16384 | 512 | 4096 | 1.233 | 55736.617 | 93.9 | Test large-row/small-column output, which should fit the column-oriented kernel well |
-| Taller output, deep K | 32768 | 512 | 4096 | 2.470 | 55639.960 | 98.5 | Check whether the tall-output trend holds with more row blocks |
-| Tall output, wider N | 16384 | 1024 | 4096 | 2.547 | 53867.297 | 92.3 | Separate tall-shape behavior from the extreme `N=512` case |
-| Wide output, deep K | 512 | 16384 | 4096 | 1.465 | 46918.678 | 81.0 | Contrast against tall output with the same output element count |
-| Wider output, deep K | 512 | 32768 | 4096 | 4.657 | 29512.454 | 53.3 | Check whether increasing `N` further hurts the column-oriented kernel |
-| Wide output, taller M | 1024 | 16384 | 4096 | 3.146 | 43686.831 | 78.0 | Check whether adding more row blocks improves wide-output utilization |
-| Tall output, shallow K | 16384 | 128 | 512 | 0.052 | 41464.470 | 88.2 | Measure the effect of lower arithmetic intensity |
-| Wide output, shallow K | 512 | 16384 | 512 | 0.171 | 50221.158 | 100.3 | Compare shallow-K behavior against the tall case |
+| Tall output, deep K | 16384 | 512 | 4096 | 1.360 | 50528.455 | 89.2 | Test large-row/small-column output, which should fit the column-oriented kernel well |
+| Taller output, deep K | 32768 | 512 | 4096 | 2.754 | 49908.289 | 88.6 | Check whether the tall-output trend holds with more row blocks |
+| Tall output, wider N | 16384 | 1024 | 4096 | 2.778 | 49474.318 | 87.5 | Separate tall-shape behavior from the extreme `N=512` case |
+| Wide output, deep K | 512 | 16384 | 4096 | 1.327 | 51792.321 | 94.0 | Contrast against tall output with the same output element count |
+| Wider output, deep K | 512 | 32768 | 4096 | 2.636 | 52144.525 | 94.1 | Check whether increasing `N` further hurts the column-oriented kernel |
+| Wide output, taller M | 1024 | 16384 | 4096 | 2.594 | 52986.189 | 93.9 | Check whether adding more row blocks improves wide-output utilization |
+| Tall output, shallow K | 16384 | 512 | 512 | 0.171 | 50226.112 | 100.6 | Measure the effect of lower arithmetic intensity |
+| Wide output, shallow K | 512 | 16384 | 512 | 0.171 | 50252.251 | 100.5 | Compare shallow-K behavior against the tall case |
