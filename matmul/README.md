@@ -19,7 +19,8 @@ This directory tracks experiments for optimizing `matmul.cu` and comparing it wi
 Basic benchmark with cuBLAS comparison:
 
 ```bash
-/usr/local/cuda/bin/nvcc -O3 -DUSE_CUBLAS matmul.cu -o matmul -Xcompiler -fopenmp -lcublas
+/usr/local/cuda/bin/nvcc -O3 -DUSE_CUBLAS \
+ matmul.cu -o matmul -Xcompiler -fopenmp -lcublas
 ```
 
 With NVTX ranges for Nsight Systems / Nsight Compute:
@@ -83,7 +84,7 @@ Nsight Compute, cuBLAS range:
 | v1 | tiled kernel | 34.850 | 3943.765 | 3.90x | 6.6 |  |
 | v2 | 256 threads/block, 4x4 thread tile | 4.132 | 33259 | 8.43x | 55.6 |  |
 | v3 | interleaved B | 4.382 | 31362.947 | 0.94x | 52.4 | Regressed; <br> motivated transpose B |
-| v4 | column major + transpose B | 3.773 | 36424.729 | 1.16x | 60.3 |  |
+| v4 | transpose B shared layout | 3.773 | 36424.729 | 1.16x | 60.3 |  |
 | v5 | warp tiling | 3.728 | 36867.842 | 1.01x | 60.8 |  |
 | v6 | vectorized load/store + larger tile | 3.242 | 42393.469 | 1.15x | 70.9 |  |
 | v7 | factorize compute | 3.097 | 44372.431 | 1.05x | 74.2 |  |
@@ -133,13 +134,13 @@ Use the same structure for each kernel note:
 - **Result:** `4.382 ms`, `31362.947 GFLOP/s`, `52.4%` of cuBLAS.
 - **Takeaway:** The idea was reasonable for the row-major kernel: instead of making each thread own four contiguous columns, distribute those columns across the warp so a fixed `j` step maps to neighboring output columns. However, this was only a partial reordering of the `B` tile: it made the warp-level column pattern more regular, but the compute loop still did not get a simple `k`-fixed, column-contiguous view of `B`. This regression made the next step clearer: rather than layering another fix onto the row-major/interleaved layout, reorganize `B` in shared memory around the way the inner outer-product loop actually consumes it.
 
-## Kernel 4 / Column-Major Transposed Shared B
+## Kernel 4 / Transposed Shared B
 
-- **Goal:** Align the shared `B` layout with the column-major output/write pattern.
-- **Implementation:** Reorganize `B` in shared memory so the compute loop can read contiguous or conflict-reduced values.
+- **Goal:** Align the shared `B` layout with the way the inner outer-product loop consumes `B`.
+- **Implementation:** Repack `B` in shared memory with a transposed layout so each fixed-`k` compute step can read the needed columns in a regular layout.
 - **Expected effect:** Better shared-memory locality and fewer bank conflicts than the previous `B` layout.
 - **Result:** `3.773 ms`, `36424.729 GFLOP/s`, `60.3%` of cuBLAS.
-- **Takeaway:** The benefit comes from matching shared `B` layout to the way the compute loop reads `B`, not mainly from storing `C`. `C` is already written in column-major order; transposing/reordering `B` in shared memory makes the inner-loop reads more regular and recovers the v3 regression.
+- **Takeaway:** The benefit comes from matching shared `B` layout to the way the compute loop reads `B`. Transposing/reordering `B` in shared memory makes the inner-loop reads more regular and recovers the v3 regression.
 
 ## Kernel 5 / Warp Tiling
 
@@ -171,7 +172,7 @@ Use the same structure for each kernel note:
 - **Implementation:** Adjust lane decomposition so each warp's memory and compute pattern better matches the `8x8` thread tile.
 - **Expected effect:** Improve coalescing, shared-memory access regularity, and scheduler efficiency.
 - **Result:** `2.964 ms`, `46376.830 GFLOP/s`, `77.5%` of cuBLAS.
-- **Takeaway:** Lane mapping changed the warp's traversal order from column-first to row-first inside each warp tile. This made neighboring lanes cover different row bands within the same column group, which fits the later column-major output/shared-memory access pattern better.
+- **Takeaway:** Lane mapping changed the warp's traversal order from column-first to row-first inside each warp tile. This made neighboring lanes cover different row bands within the same column group, which fits the later shared-memory and vectorized access pattern better.
 
 ## Kernel 9 / Double Buffering
 
@@ -196,11 +197,11 @@ Use the same structure for each kernel note:
 | Shape class | M | N | K | Custom time (ms) | Custom GFLOP/s | cuBLAS (%) | Purpose |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | Baseline square | 4096 | 4096 | 4096 | 2.456 | 55952.032 | 93.8 | Reference point for existing results |
-| Tall output, deep K | 16384 | 512 | 4096 | 1.360 | 50528.455 | 89.2 | Test large-row/small-column output, which should fit the column-oriented kernel well |
+| Tall output, deep K | 16384 | 512 | 4096 | 1.360 | 50528.455 | 89.2 | Test large-row/small-column output against the current tiled kernel |
 | Taller output, deep K | 32768 | 512 | 4096 | 2.754 | 49908.289 | 88.6 | Check whether the tall-output trend holds with more row blocks |
 | Tall output, wider N | 16384 | 1024 | 4096 | 2.778 | 49474.318 | 87.5 | Separate tall-shape behavior from the extreme `N=512` case |
 | Wide output, deep K | 512 | 16384 | 4096 | 1.327 | 51792.321 | 94.0 | Contrast against tall output with the same output element count |
-| Wider output, deep K | 512 | 32768 | 4096 | 2.636 | 52144.525 | 94.1 | Check whether increasing `N` further hurts the column-oriented kernel |
+| Wider output, deep K | 512 | 32768 | 4096 | 2.636 | 52144.525 | 94.1 | Check whether increasing `N` further hurts the current tiled kernel |
 | Wide output, taller M | 1024 | 16384 | 4096 | 2.594 | 52986.189 | 93.9 | Check whether adding more row blocks improves wide-output utilization |
 | Tall output, shallow K | 16384 | 512 | 512 | 0.171 | 50226.112 | 100.6 | Measure the effect of lower arithmetic intensity |
 | Wide output, shallow K | 512 | 16384 | 512 | 0.171 | 50252.251 | 100.5 | Compare shallow-K behavior against the tall case |
