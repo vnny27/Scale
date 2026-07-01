@@ -168,6 +168,6 @@ Use the same structure for each kernel note:
 - **Implementation:** Expand the warp tile from `32x16` to `32x32`. Each warp now uses two A fragments and four B fragments, issuing eight native `m16n8k8` MMA instructions per `K=8` slice.
 - **Expected effect:** Reuse the same A fragments across four N halves and reduce per-output scheduling overhead, while accepting higher accumulator register pressure.
 - **Result:** `2.057 ms`, `66803.034 GFLOP/s`, `80.0%` of cuBLAS.
-- **Takeaway:** The `32x32` warp tile lets each A fragment feed four N halves, so the fragment loads, address calculation, and double-buffering overhead are amortized over more MMA instructions. This recovers WMMA-level performance.
+- **Takeaway:** The `32x32` warp tile mainly improves register reuse of A fragments: each loaded A fragment is reused across four `N=8` MMA slices instead of two. Since each block also covers twice as many output columns, the same A shared tile and async pipeline steps feed more MMA work. This recovers WMMA-level performance.
 
 ## Future Work
