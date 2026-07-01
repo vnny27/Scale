@@ -41,6 +41,14 @@ To test another experiment, replace `matmul_tensor.cu` with the target source fi
 
 ## Run
 
+Run all benchmark versions:
+
+```bash
+./scripts/run.sh
+```
+
+This builds every source under `src/`, runs each binary with cuBLAS comparison, and writes one combined log plus a compact summary TSV under `results/`.
+
 Correctness check:
 
 ```bash
