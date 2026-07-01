@@ -217,8 +217,12 @@ void print_time_result(const char* label, float elapsed_ms, const VersionConfig&
 }
 
 void print_time_comparison(float custom_ms, float cublas_ms) {
-    std::cout << ">>> Custom kernel is " << (cublas_ms / custom_ms)
-              << "x faster than cuBLAS SGEMM." << std::endl;
+    if (custom_ms <= 0.0f || cublas_ms <= 0.0f) return;
+
+    float cublas_percent = (cublas_ms / custom_ms) * 100.0f;
+    std::cout << ">>> Custom performance vs cuBLAS: "
+              << cublas_percent
+              << "% (cuBLAS = 100.0%)" << std::endl;
 }
 
 void profiler_range_push(const char* name) {

@@ -170,9 +170,10 @@ void print_time_result(const char* label, float elapsed_ms,
 void print_time_comparison(float custom_ms, float cublas_ms) {
     if (custom_ms <= 0.0f || cublas_ms <= 0.0f) return;
 
-    std::cout << ">>> Custom time vs cuBLAS: "
-              << (custom_ms / cublas_ms)
-              << "x (cuBLAS = 1.000x)" << std::endl;
+    float cublas_percent = (cublas_ms / custom_ms) * 100.0f;
+    std::cout << ">>> Custom performance vs cuBLAS: "
+              << cublas_percent
+              << "% (cuBLAS = 100.0%)" << std::endl;
 }
 
 void profiler_range_push(const char* name) {
