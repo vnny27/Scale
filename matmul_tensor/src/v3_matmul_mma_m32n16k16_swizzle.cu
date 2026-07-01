@@ -67,31 +67,31 @@ __device__ __forceinline__ void mma_m16n8k8_tf32(
           "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 
-__device__ __forceinline__ int swizzle_a_col(int row, int col) {
-    return col ^ ((row & 7) << 2);
+__device__ __forceinline__ int swizzle_a_m(int k, int m) {
+    return m ^ ((k & 3) << 3);
 }
 
-__device__ __forceinline__ int swizzle_b_col(int row, int col) {
-    return col ^ ((row & 3) << 3);
+__device__ __forceinline__ int swizzle_b_k(int n, int k) {
+    return k ^ ((n & 7) << 2);
 }
 __global__ void matmul(
     const float *__restrict__ A,
     const float *__restrict__ B,
     float *__restrict__ C) {
-    __shared__ unsigned int shared_a[BLOCK_M][BLOCK_K + 1];
-    __shared__ unsigned int shared_b[BLOCK_K][BLOCK_N + 1];
+    __shared__ unsigned int shared_a[BLOCK_K][BLOCK_M];
+    __shared__ unsigned int shared_b[BLOCK_N][BLOCK_K];
 
     int warp_id = threadIdx.x / WARP_THREADS;
     int lane_id = threadIdx.x % WARP_THREADS;
     int group_id = lane_id / 4;
     int thread_in_group = lane_id % 4;
 
-    int warp_m = warp_id / WARPS_N;
-    int warp_n = warp_id % WARPS_N;
+    int warp_m = warp_id % WARPS_M;
+    int warp_n = warp_id / WARPS_M;
 
-    int blocks_n = MATRIX_N / BLOCK_N;
-    int block_m = blockIdx.x / blocks_n;
-    int block_n = blockIdx.x % blocks_n;
+    int blocks_m = MATRIX_M / BLOCK_M;
+    int block_m = blockIdx.x % blocks_m;
+    int block_n = blockIdx.x / blocks_m;
 
     int block_base_row = block_m * BLOCK_M;
     int block_base_col = block_n * BLOCK_N;
@@ -105,15 +105,15 @@ __global__ void matmul(
 
     for (int k = 0; k < MATRIX_K; k += BLOCK_K) {
         for (int idx = threadIdx.x; idx < BLOCK_M * BLOCK_K; idx += BLOCK_THREADS) {
-            int row = idx % BLOCK_M;
-            int col = idx / BLOCK_M;
-            shared_a[row][swizzle_a_col(row, col)] = f32_to_tf32(A[(block_base_row + row) + (k + col) * MATRIX_M]);
+            int m = idx % BLOCK_M;
+            int kk = idx / BLOCK_M;
+            shared_a[kk][swizzle_a_m(kk, m)] = f32_to_tf32(A[(block_base_row + m) + (k + kk) * MATRIX_M]);
         }
 
         for (int idx = threadIdx.x; idx < BLOCK_K * BLOCK_N; idx += BLOCK_THREADS) {
-            int row = idx % BLOCK_K;
-            int col = idx / BLOCK_K;
-            shared_b[row][swizzle_b_col(row, col)] = f32_to_tf32(B[(k + row) + (block_base_col + col) * MATRIX_K]);
+            int kk = idx % BLOCK_K;
+            int n = idx / BLOCK_K;
+            shared_b[n][swizzle_b_k(n, kk)] = f32_to_tf32(B[(k + kk) + (block_base_col + n) * MATRIX_K]);
         }
 
         __syncthreads();
@@ -136,21 +136,21 @@ __global__ void matmul(
 
             int a_col0 = kk + thread_in_group;
             int a_col1 = kk + thread_in_group + 4;
-            a_m0_frag[0] = shared_a[a_m0_row0][swizzle_a_col(a_m0_row0, a_col0)];
-            a_m0_frag[1] = shared_a[a_m0_row1][swizzle_a_col(a_m0_row1, a_col0)];
-            a_m0_frag[2] = shared_a[a_m0_row0][swizzle_a_col(a_m0_row0, a_col1)];
-            a_m0_frag[3] = shared_a[a_m0_row1][swizzle_a_col(a_m0_row1, a_col1)];
-            a_m1_frag[0] = shared_a[a_m1_row0][swizzle_a_col(a_m1_row0, a_col0)];
-            a_m1_frag[1] = shared_a[a_m1_row1][swizzle_a_col(a_m1_row1, a_col0)];
-            a_m1_frag[2] = shared_a[a_m1_row0][swizzle_a_col(a_m1_row0, a_col1)];
-            a_m1_frag[3] = shared_a[a_m1_row1][swizzle_a_col(a_m1_row1, a_col1)];
+            a_m0_frag[0] = shared_a[a_col0][swizzle_a_m(a_col0, a_m0_row0)];
+            a_m0_frag[1] = shared_a[a_col0][swizzle_a_m(a_col0, a_m0_row1)];
+            a_m0_frag[2] = shared_a[a_col1][swizzle_a_m(a_col1, a_m0_row0)];
+            a_m0_frag[3] = shared_a[a_col1][swizzle_a_m(a_col1, a_m0_row1)];
+            a_m1_frag[0] = shared_a[a_col0][swizzle_a_m(a_col0, a_m1_row0)];
+            a_m1_frag[1] = shared_a[a_col0][swizzle_a_m(a_col0, a_m1_row1)];
+            a_m1_frag[2] = shared_a[a_col1][swizzle_a_m(a_col1, a_m1_row0)];
+            a_m1_frag[3] = shared_a[a_col1][swizzle_a_m(a_col1, a_m1_row1)];
 
             int b_row0 = kk + thread_in_group;
             int b_row1 = kk + thread_in_group + 4;
-            b_left[0] = shared_b[b_row0][swizzle_b_col(b_row0, b_col_left)];
-            b_left[1] = shared_b[b_row1][swizzle_b_col(b_row1, b_col_left)];
-            b_right[0] = shared_b[b_row0][swizzle_b_col(b_row0, b_col_right)];
-            b_right[1] = shared_b[b_row1][swizzle_b_col(b_row1, b_col_right)];
+            b_left[0] = shared_b[b_col_left][swizzle_b_k(b_col_left, b_row0)];
+            b_left[1] = shared_b[b_col_left][swizzle_b_k(b_col_left, b_row1)];
+            b_right[0] = shared_b[b_col_right][swizzle_b_k(b_col_right, b_row0)];
+            b_right[1] = shared_b[b_col_right][swizzle_b_k(b_col_right, b_row1)];
 
             float out[4];
             mma_m16n8k8_tf32(out, a_m0_frag, b_left, acc_m0_left);

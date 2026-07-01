@@ -34,7 +34,7 @@ struct VersionConfig {
 #define MATRIX_N 4096
 #define MATRIX_K 4096
 #define MMA_M 16
-#define MMA_N 8
+#define MMA_N 16
 #define MMA_K 8
 #define WARPS_PER_BLOCK 8
 #define WARP_THREADS 32
@@ -70,18 +70,20 @@ __global__ void matmul(
     int thread_in_group = lane_id % 4;
 
     int tile_id = blockIdx.x * WARPS_PER_BLOCK + warp_id;
-    int tiles_n = MATRIX_N / MMA_N;
-    int tile_m = tile_id / tiles_n;
-    int tile_n = tile_id % tiles_n;
+    int tiles_m = MATRIX_M / MMA_M;
+    int tile_m = tile_id % tiles_m;
+    int tile_n = tile_id / tiles_m;
 
     int base_row = tile_m * MMA_M;
     int base_col = tile_n * MMA_N;
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc_left[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc_right[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int k = 0; k < MATRIX_K; k += MMA_K) {
         unsigned int a_frag[4];
-        unsigned int b_frag[2];
+        unsigned int b_left[2];
+        unsigned int b_right[2];
 
         int a_row0 = group_id;
         int a_row1 = group_id + 8;
@@ -92,27 +94,42 @@ __global__ void matmul(
         a_frag[2] = f32_to_tf32(A[(base_row + a_row0) + (k + a_col1) * MATRIX_M]);
         a_frag[3] = f32_to_tf32(A[(base_row + a_row1) + (k + a_col1) * MATRIX_M]);
 
-        int b_col = group_id;
+        int b_col_left = group_id;
+        int b_col_right = group_id + 8;
         int b_row0 = thread_in_group;
         int b_row1 = thread_in_group + 4;
-        b_frag[0] = f32_to_tf32(B[(k + b_row0) + (base_col + b_col) * MATRIX_K]);
-        b_frag[1] = f32_to_tf32(B[(k + b_row1) + (base_col + b_col) * MATRIX_K]);
+        b_left[0] = f32_to_tf32(B[(k + b_row0) + (base_col + b_col_left) * MATRIX_K]);
+        b_left[1] = f32_to_tf32(B[(k + b_row1) + (base_col + b_col_left) * MATRIX_K]);
+        b_right[0] = f32_to_tf32(B[(k + b_row0) + (base_col + b_col_right) * MATRIX_K]);
+        b_right[1] = f32_to_tf32(B[(k + b_row1) + (base_col + b_col_right) * MATRIX_K]);
 
-        float out[4];
-        mma_m16n8k8_tf32(out, a_frag, b_frag, acc);
-        acc[0] = out[0];
-        acc[1] = out[1];
-        acc[2] = out[2];
-        acc[3] = out[3];
+        float out_left[4];
+        float out_right[4];
+        mma_m16n8k8_tf32(out_left, a_frag, b_left, acc_left);
+        mma_m16n8k8_tf32(out_right, a_frag, b_right, acc_right);
+        acc_left[0] = out_left[0];
+        acc_left[1] = out_left[1];
+        acc_left[2] = out_left[2];
+        acc_left[3] = out_left[3];
+        acc_right[0] = out_right[0];
+        acc_right[1] = out_right[1];
+        acc_right[2] = out_right[2];
+        acc_right[3] = out_right[3];
     }
 
     int c_col0 = thread_in_group * 2;
     int c_row0 = group_id;
     int c_row1 = group_id + 8;
-    C[(base_row + c_row0) + (base_col + c_col0 + 0) * MATRIX_M] = acc[0];
-    C[(base_row + c_row0) + (base_col + c_col0 + 1) * MATRIX_M] = acc[1];
-    C[(base_row + c_row1) + (base_col + c_col0 + 0) * MATRIX_M] = acc[2];
-    C[(base_row + c_row1) + (base_col + c_col0 + 1) * MATRIX_M] = acc[3];
+    C[(base_row + c_row0) + (base_col + c_col0 + 0) * MATRIX_M] = acc_left[0];
+    C[(base_row + c_row0) + (base_col + c_col0 + 1) * MATRIX_M] = acc_left[1];
+    C[(base_row + c_row1) + (base_col + c_col0 + 0) * MATRIX_M] = acc_left[2];
+    C[(base_row + c_row1) + (base_col + c_col0 + 1) * MATRIX_M] = acc_left[3];
+
+    int right_col = base_col + 8;
+    C[(base_row + c_row0) + (right_col + c_col0 + 0) * MATRIX_M] = acc_right[0];
+    C[(base_row + c_row0) + (right_col + c_col0 + 1) * MATRIX_M] = acc_right[1];
+    C[(base_row + c_row1) + (right_col + c_col0 + 0) * MATRIX_M] = acc_right[2];
+    C[(base_row + c_row1) + (right_col + c_col0 + 1) * MATRIX_M] = acc_right[3];
 }
 void fill_random(float* arr, size_t size) {
     std::mt19937 gen(SEED);
