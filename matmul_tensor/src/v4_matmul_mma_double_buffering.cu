@@ -1,0 +1,593 @@
+#include <cstdio>
+#include <cstdlib>
+#include <chrono>
+#include <math.h>
+#include <iostream>
+#include <fstream>
+#include <omp.h>
+#include <random>
+#include <algorithm>
+#include <string>
+#include <iomanip>
+
+#include </usr/local/cuda/include/cuda.h>
+#include </usr/local/cuda/include/cuda_runtime_api.h>
+#ifdef USE_CUBLAS
+#include <cublas_v2.h>
+#endif
+#ifdef USE_NVTX
+#include <nvToolsExt.h>
+#endif
+
+struct VersionConfig {
+    long int M;
+    long int K;
+    long int N;
+};
+
+#define SEED 1234
+#define WARMUP_ITERATIONS 2
+#define BENCHMARK_ITERATIONS 10
+
+
+#define MATRIX_M 4096
+#define MATRIX_N 4096
+#define MATRIX_K 4096
+#define MMA_M 16
+#define MMA_N 8
+#define MMA_K 8
+#define WARP_TILE_M 32
+#define WARP_TILE_N 16
+#define WARPS_M 4
+#define WARPS_N 2
+#define WARPS_PER_BLOCK (WARPS_M * WARPS_N)
+#define WARP_THREADS 32
+#define BLOCK_THREADS (WARPS_PER_BLOCK * WARP_THREADS)
+#define BLOCK_M (WARPS_M * WARP_TILE_M)
+#define BLOCK_N (WARPS_N * WARP_TILE_N)
+#define BLOCK_K 32
+
+__device__ __forceinline__ unsigned int f32_to_tf32(float x) {
+    unsigned int y;
+    asm volatile("cvt.rna.tf32.f32 %0, %1;" : "=r"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ void mma_m16n8k8_tf32(
+    float d[4], const unsigned int a[4], const unsigned int b[2], const float c[4]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+
+__device__ __forceinline__ unsigned int smem_addr(const void* ptr) {
+    unsigned int addr;
+    asm volatile(
+        "{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }\n"
+        : "=r"(addr)
+        : "l"(ptr));
+    return addr;
+}
+
+__device__ __forceinline__ void cp_async_16(void* smem_ptr, const void* gmem_ptr) {
+    unsigned int dst = smem_addr(smem_ptr);
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        :
+        : "r"(dst), "l"(gmem_ptr));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+__device__ __forceinline__ int swizzle_a_m(int k, int m) {
+    return m ^ ((k & 3) << 3);
+}
+
+__device__ __forceinline__ int swizzle_b_k(int n, int k) {
+    return k ^ ((n & 7) << 2);
+}
+
+__global__ void matmul(
+    const float *__restrict__ A,
+    const float *__restrict__ B,
+    float *__restrict__ C) {
+    __shared__ unsigned int shared_a[2][BLOCK_K][BLOCK_M];
+    __shared__ unsigned int shared_b[2][BLOCK_N][BLOCK_K];
+
+    int warp_id = threadIdx.x / WARP_THREADS;
+    int lane_id = threadIdx.x % WARP_THREADS;
+    int group_id = lane_id / 4;
+    int thread_in_group = lane_id % 4;
+
+    int warp_m = warp_id % WARPS_M;
+    int warp_n = warp_id / WARPS_M;
+
+    int blocks_m = MATRIX_M / BLOCK_M;
+    int block_m = blockIdx.x % blocks_m;
+    int block_n = blockIdx.x / blocks_m;
+
+    int block_base_row = block_m * BLOCK_M;
+    int block_base_col = block_n * BLOCK_N;
+    int base_row = block_base_row + warp_m * WARP_TILE_M;
+    int base_col = block_base_col + warp_n * WARP_TILE_N;
+
+    float acc_m0_left[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc_m0_right[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc_m1_left[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc_m1_right[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    int warp_row_base = warp_m * WARP_TILE_M;
+    int warp_col_base = warp_n * WARP_TILE_N;
+    int a_m0_row0 = warp_row_base + group_id;
+    int a_m0_row1 = warp_row_base + group_id + 8;
+    int a_m1_row0 = warp_row_base + 16 + group_id;
+    int a_m1_row1 = warp_row_base + 16 + group_id + 8;
+    int b_col_left = warp_col_base + group_id;
+    int b_col_right = warp_col_base + group_id + 8;
+
+    for (int idx = threadIdx.x; idx < (BLOCK_M * BLOCK_K) / 4; idx += BLOCK_THREADS) {
+        int m = (idx % (BLOCK_M / 4)) * 4;
+        int kk = idx / (BLOCK_M / 4);
+        cp_async_16(
+            &shared_a[0][kk][swizzle_a_m(kk, m)],
+            &A[(block_base_row + m) + kk * MATRIX_M]);
+    }
+
+    for (int idx = threadIdx.x; idx < (BLOCK_K * BLOCK_N) / 4; idx += BLOCK_THREADS) {
+        int kk = (idx % (BLOCK_K / 4)) * 4;
+        int n = idx / (BLOCK_K / 4);
+        cp_async_16(
+            &shared_b[0][n][swizzle_b_k(n, kk)],
+            &B[kk + (block_base_col + n) * MATRIX_K]);
+    }
+    cp_async_commit();
+
+    for (int k = 0; k < MATRIX_K; k += BLOCK_K) {
+        int stage = (k / BLOCK_K) & 1;
+        int next_k = k + BLOCK_K;
+
+        cp_async_wait_all();
+        __syncthreads();
+
+        if (next_k < MATRIX_K) {
+            int next_stage = stage ^ 1;
+            for (int idx = threadIdx.x; idx < (BLOCK_M * BLOCK_K) / 4; idx += BLOCK_THREADS) {
+                int m = (idx % (BLOCK_M / 4)) * 4;
+                int kk = idx / (BLOCK_M / 4);
+                cp_async_16(
+                    &shared_a[next_stage][kk][swizzle_a_m(kk, m)],
+                    &A[(block_base_row + m) + (next_k + kk) * MATRIX_M]);
+            }
+
+            for (int idx = threadIdx.x; idx < (BLOCK_K * BLOCK_N) / 4; idx += BLOCK_THREADS) {
+                int kk = (idx % (BLOCK_K / 4)) * 4;
+                int n = idx / (BLOCK_K / 4);
+                cp_async_16(
+                    &shared_b[next_stage][n][swizzle_b_k(n, kk)],
+                    &B[(next_k + kk) + (block_base_col + n) * MATRIX_K]);
+            }
+            cp_async_commit();
+        }
+
+#pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += MMA_K) {
+            unsigned int a_m0_frag[4];
+            unsigned int a_m1_frag[4];
+            unsigned int b_left[2];
+            unsigned int b_right[2];
+
+            int a_col0 = kk + thread_in_group;
+            int a_col1 = kk + thread_in_group + 4;
+            a_m0_frag[0] = f32_to_tf32(__uint_as_float(shared_a[stage][a_col0][swizzle_a_m(a_col0, a_m0_row0)]));
+            a_m0_frag[1] = f32_to_tf32(__uint_as_float(shared_a[stage][a_col0][swizzle_a_m(a_col0, a_m0_row1)]));
+            a_m0_frag[2] = f32_to_tf32(__uint_as_float(shared_a[stage][a_col1][swizzle_a_m(a_col1, a_m0_row0)]));
+            a_m0_frag[3] = f32_to_tf32(__uint_as_float(shared_a[stage][a_col1][swizzle_a_m(a_col1, a_m0_row1)]));
+            a_m1_frag[0] = f32_to_tf32(__uint_as_float(shared_a[stage][a_col0][swizzle_a_m(a_col0, a_m1_row0)]));
+            a_m1_frag[1] = f32_to_tf32(__uint_as_float(shared_a[stage][a_col0][swizzle_a_m(a_col0, a_m1_row1)]));
+            a_m1_frag[2] = f32_to_tf32(__uint_as_float(shared_a[stage][a_col1][swizzle_a_m(a_col1, a_m1_row0)]));
+            a_m1_frag[3] = f32_to_tf32(__uint_as_float(shared_a[stage][a_col1][swizzle_a_m(a_col1, a_m1_row1)]));
+
+            int b_row0 = kk + thread_in_group;
+            int b_row1 = kk + thread_in_group + 4;
+            b_left[0] = f32_to_tf32(__uint_as_float(shared_b[stage][b_col_left][swizzle_b_k(b_col_left, b_row0)]));
+            b_left[1] = f32_to_tf32(__uint_as_float(shared_b[stage][b_col_left][swizzle_b_k(b_col_left, b_row1)]));
+            b_right[0] = f32_to_tf32(__uint_as_float(shared_b[stage][b_col_right][swizzle_b_k(b_col_right, b_row0)]));
+            b_right[1] = f32_to_tf32(__uint_as_float(shared_b[stage][b_col_right][swizzle_b_k(b_col_right, b_row1)]));
+
+            float out[4];
+            mma_m16n8k8_tf32(out, a_m0_frag, b_left, acc_m0_left);
+            acc_m0_left[0] = out[0];
+            acc_m0_left[1] = out[1];
+            acc_m0_left[2] = out[2];
+            acc_m0_left[3] = out[3];
+
+            mma_m16n8k8_tf32(out, a_m0_frag, b_right, acc_m0_right);
+            acc_m0_right[0] = out[0];
+            acc_m0_right[1] = out[1];
+            acc_m0_right[2] = out[2];
+            acc_m0_right[3] = out[3];
+
+            mma_m16n8k8_tf32(out, a_m1_frag, b_left, acc_m1_left);
+            acc_m1_left[0] = out[0];
+            acc_m1_left[1] = out[1];
+            acc_m1_left[2] = out[2];
+            acc_m1_left[3] = out[3];
+
+            mma_m16n8k8_tf32(out, a_m1_frag, b_right, acc_m1_right);
+            acc_m1_right[0] = out[0];
+            acc_m1_right[1] = out[1];
+            acc_m1_right[2] = out[2];
+            acc_m1_right[3] = out[3];
+        }
+
+        __syncthreads();
+    }
+
+    int c_col0 = thread_in_group * 2;
+    int c_row0 = group_id;
+    int c_row1 = group_id + 8;
+
+    C[(base_row + c_row0) + (base_col + c_col0 + 0) * MATRIX_M] = acc_m0_left[0];
+    C[(base_row + c_row0) + (base_col + c_col0 + 1) * MATRIX_M] = acc_m0_left[1];
+    C[(base_row + c_row1) + (base_col + c_col0 + 0) * MATRIX_M] = acc_m0_left[2];
+    C[(base_row + c_row1) + (base_col + c_col0 + 1) * MATRIX_M] = acc_m0_left[3];
+
+    int right_col = base_col + 8;
+    C[(base_row + c_row0) + (right_col + c_col0 + 0) * MATRIX_M] = acc_m0_right[0];
+    C[(base_row + c_row0) + (right_col + c_col0 + 1) * MATRIX_M] = acc_m0_right[1];
+    C[(base_row + c_row1) + (right_col + c_col0 + 0) * MATRIX_M] = acc_m0_right[2];
+    C[(base_row + c_row1) + (right_col + c_col0 + 1) * MATRIX_M] = acc_m0_right[3];
+
+    int base_row_m1 = base_row + 16;
+    C[(base_row_m1 + c_row0) + (base_col + c_col0 + 0) * MATRIX_M] = acc_m1_left[0];
+    C[(base_row_m1 + c_row0) + (base_col + c_col0 + 1) * MATRIX_M] = acc_m1_left[1];
+    C[(base_row_m1 + c_row1) + (base_col + c_col0 + 0) * MATRIX_M] = acc_m1_left[2];
+    C[(base_row_m1 + c_row1) + (base_col + c_col0 + 1) * MATRIX_M] = acc_m1_left[3];
+
+    C[(base_row_m1 + c_row0) + (right_col + c_col0 + 0) * MATRIX_M] = acc_m1_right[0];
+    C[(base_row_m1 + c_row0) + (right_col + c_col0 + 1) * MATRIX_M] = acc_m1_right[1];
+    C[(base_row_m1 + c_row1) + (right_col + c_col0 + 0) * MATRIX_M] = acc_m1_right[2];
+    C[(base_row_m1 + c_row1) + (right_col + c_col0 + 1) * MATRIX_M] = acc_m1_right[3];
+}
+void fill_random(float* arr, size_t size) {
+    std::mt19937 gen(SEED);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    for (size_t i = 0; i < size; ++i) {
+        arr[i] = dist(gen);
+    }
+}
+
+bool validate(const float* A, const float* B, size_t size, float rtol = 1e-3f, float atol = 1e-2f) {
+    for (size_t i = 0; i < size; ++i) {
+        float diff = fabs(A[i] - B[i]);
+        float tol = atol + rtol * fabs(A[i]);
+        if (diff > tol) return false;
+    }
+    return true;
+}
+
+#ifdef USE_CUBLAS
+const char* cublas_status_string(cublasStatus_t status) {
+    switch (status) {
+        case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
+        case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
+        case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
+        case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
+        case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
+        case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
+        case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
+        case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
+        case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
+        default: return "CUBLAS_STATUS_UNKNOWN";
+    }
+}
+#endif
+
+double gflops(const VersionConfig& config, float elapsed_ms) {
+    if (elapsed_ms <= 0.0f) return 0.0;
+    double ops = 2.0 * (double)config.M * (double)config.N * (double)config.K;
+    return ops / ((double)elapsed_ms * 1.0e6);
+}
+
+void print_time_result(const char* label, float elapsed_ms, const VersionConfig& config) {
+    std::cout << ">>> " << label << " execution time: " << elapsed_ms
+              << " ms (" << gflops(config, elapsed_ms) << " GFLOP/s)" << std::endl;
+}
+
+void print_time_comparison(float custom_ms, float cublas_ms) {
+    std::cout << ">>> Custom kernel is " << (cublas_ms / custom_ms)
+              << "x faster than cuBLAS SGEMM." << std::endl;
+}
+
+void profiler_range_push(const char* name) {
+#ifdef USE_NVTX
+    nvtxRangePushA(name);
+#else
+    (void)name;
+#endif
+}
+
+void profiler_range_pop() {
+#ifdef USE_NVTX
+    nvtxRangePop();
+#endif
+}
+
+void print_first_10(const float* arr, size_t size) {
+    size_t limit = std::min(size, (size_t)10);
+    for (size_t i = 0; i < limit; ++i) {
+        std::cout << arr[i] << " ";
+    }
+    std::cout << std::endl;
+}
+
+float* cpu(const float* A, const float* B, int A_height, int A_width, int B_width) {
+    float* C = new float[(size_t)A_height * B_width]();
+
+    omp_set_num_threads(6);
+    #pragma omp parallel for
+    for (int j = 0; j < B_width; ++j) {
+        for (int k = 0; k < A_width; ++k) {
+            float Bkj = B[k + j * A_width];
+            for (int i = 0; i < A_height; ++i) {
+                C[i + j * A_height] += A[i + k * A_height] * Bkj;
+            }
+        }
+    }
+
+    return C;
+}
+
+void print_usage(const char* program) {
+    std::cout << "Usage: " << program << " [--verify|-v] [--cublas|-b] [--help|-h]\n"
+              << "  --verify, -v  Copy result back and run CPU validation.\n"
+              << "  --cublas, -b  Compare custom kernel time with cuBLAS SGEMM.\n"
+              << "  --help, -h    Show this help message.\n";
+}
+
+int main(int argc, char* argv[]) {
+
+    bool verify = false;
+    bool compare_cublas = false;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--verify" || arg == "-v") {
+            verify = true;
+        } else if (arg == "--cublas" || arg == "-b") {
+            compare_cublas = true;
+        } else if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            std::cerr << "Unknown option: " << arg << "\n";
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+#ifndef USE_CUBLAS
+    if (compare_cublas) {
+        std::cerr << "cuBLAS comparison requested, but this binary was built without USE_CUBLAS.\n"
+                  << "Rebuild with -DUSE_CUBLAS and link with -lcublas.\n";
+        return 1;
+    }
+#endif
+
+    VersionConfig config = {MATRIX_M, MATRIX_K, MATRIX_N};
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "----------------Mat Mul----------------\n";
+    std::cout << "Verification: " << (verify ? "on" : "off") << "\n";
+    std::cout << "cuBLAS comparison: " << (compare_cublas ? "on" : "off") << "\n";
+    std::cout << "Warmup iterations: " << WARMUP_ITERATIONS << "\n";
+    std::cout << "Benchmark iterations: " << BENCHMARK_ITERATIONS << "\n";
+
+    int A_height = config.M;
+    int A_width = config.K;
+    int B_height = config.K;
+    int B_width = config.N;
+
+    size_t A_size = (size_t)A_height * A_width;
+    size_t B_size = (size_t)B_height * B_width;
+    size_t C_size = (size_t)A_height * B_width;
+
+    float* A_host = new float[A_size];
+    float* B_host = new float[B_size];
+    float* C_host = verify ? new float[C_size] : nullptr;
+    float* C_cublas_host = (verify && compare_cublas) ? new float[C_size] : nullptr;
+
+    fill_random(A_host, A_size);
+    fill_random(B_host, B_size);
+
+    float *A_dev, *B_dev, *C_dev, *C_cublas_dev = nullptr;
+    cudaMalloc((void **)&A_dev, A_size * sizeof(float));
+    cudaMalloc((void **)&B_dev, B_size * sizeof(float));
+    cudaMalloc((void **)&C_dev, C_size * sizeof(float));
+    if (compare_cublas) {
+        cudaMalloc((void **)&C_cublas_dev, C_size * sizeof(float));
+    }
+    cudaMemcpy(A_dev, A_host, A_size * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(B_dev, B_host, B_size * sizeof(float), cudaMemcpyHostToDevice);
+    
+
+    cudaEvent_t start, stop;
+    float execution_time = 0;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    int total_blocks = (MATRIX_M / BLOCK_M) * (MATRIX_N / BLOCK_N);
+    dim3 dimGrid(total_blocks, 1, 1);
+    dim3 dimBlock(BLOCK_THREADS, 1, 1);
+    for (int i = 0; i < WARMUP_ITERATIONS; ++i) {
+        matmul<<<dimGrid, dimBlock>>>(A_dev, B_dev, C_dev);
+    }
+    cudaDeviceSynchronize();
+
+    profiler_range_push("custom_matmul");
+    cudaEventRecord(start); 
+    for (int i = 0; i < BENCHMARK_ITERATIONS; ++i) {
+        matmul<<<dimGrid, dimBlock>>>(A_dev, B_dev, C_dev);
+    }
+    cudaEventRecord(stop);
+
+    cudaError_t launchErr = cudaGetLastError();
+    cudaError_t syncErr = cudaEventSynchronize(stop);
+    profiler_range_pop();
+    if (launchErr == cudaSuccess && syncErr == cudaSuccess) {
+        cudaEventElapsedTime(&execution_time, start, stop);
+        execution_time /= BENCHMARK_ITERATIONS;
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    
+    if (launchErr != cudaSuccess) {
+        std::cout << "  [CUDA ERROR]: " << cudaGetErrorString(launchErr) << std::endl;
+    } else if (syncErr != cudaSuccess) {
+        std::cout << "  [CUDA ERROR]: " << cudaGetErrorString(syncErr) << std::endl;
+    } else {
+        print_time_result("Custom kernel", execution_time, config);
+    }
+
+    bool cublasOk = false;
+#ifdef USE_CUBLAS
+    if (compare_cublas && launchErr == cudaSuccess && syncErr == cudaSuccess) {
+        cublasHandle_t handle;
+        cublasStatus_t cublasErr = cublasCreate(&handle);
+        cudaError_t cublasSyncErr = cudaSuccess;
+        float cublas_execution_time = 0;
+
+        if (cublasErr == CUBLAS_STATUS_SUCCESS) {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+
+            cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+
+            for (int i = 0; i < WARMUP_ITERATIONS && cublasErr == CUBLAS_STATUS_SUCCESS; ++i) {
+                cublasErr = cublasSgemm(
+                    handle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    A_height, B_width, A_width,
+                    &alpha,
+                    A_dev, A_height,
+                    B_dev, A_width,
+                    &beta,
+                    C_cublas_dev, A_height);
+            }
+            cublasSyncErr = cudaDeviceSynchronize();
+
+            cudaEvent_t cublas_start, cublas_stop;
+            cudaEventCreate(&cublas_start);
+            cudaEventCreate(&cublas_stop);
+
+            if (cublasErr == CUBLAS_STATUS_SUCCESS && cublasSyncErr == cudaSuccess) {
+                profiler_range_push("cublas_sgemm");
+                cudaEventRecord(cublas_start);
+                for (int i = 0; i < BENCHMARK_ITERATIONS && cublasErr == CUBLAS_STATUS_SUCCESS; ++i) {
+                    cublasErr = cublasSgemm(
+                        handle,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        A_height, B_width, A_width,
+                        &alpha,
+                        A_dev, A_height,
+                        B_dev, A_width,
+                        &beta,
+                        C_cublas_dev, A_height);
+                }
+                cudaEventRecord(cublas_stop);
+
+                cublasSyncErr = cudaEventSynchronize(cublas_stop);
+                profiler_range_pop();
+            }
+            if (cublasErr == CUBLAS_STATUS_SUCCESS && cublasSyncErr == cudaSuccess) {
+                cudaEventElapsedTime(&cublas_execution_time, cublas_start, cublas_stop);
+                cublas_execution_time /= BENCHMARK_ITERATIONS;
+                cublasOk = true;
+            }
+
+            cudaEventDestroy(cublas_start);
+            cudaEventDestroy(cublas_stop);
+            cublasDestroy(handle);
+        }
+
+        if (cublasErr != CUBLAS_STATUS_SUCCESS) {
+            std::cout << "  [cuBLAS ERROR]: " << cublas_status_string(cublasErr) << std::endl;
+        } else if (cublasSyncErr != cudaSuccess) {
+            std::cout << "  [cuBLAS CUDA ERROR]: " << cudaGetErrorString(cublasSyncErr) << std::endl;
+        } else {
+            print_time_result("cuBLAS SGEMM", cublas_execution_time, config);
+            print_time_comparison(execution_time, cublas_execution_time);
+        }
+    } else if (compare_cublas) {
+        std::cout << ">>> cuBLAS comparison skipped because the custom kernel did not complete successfully." << std::endl;
+    }
+#endif
+    
+
+    if (verify && launchErr == cudaSuccess && syncErr == cudaSuccess) {
+        cudaMemcpy(C_host, C_dev, C_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+        float* C_answer = cpu(A_host, B_host, A_height, A_width, B_width);
+
+        if (validate(C_answer, C_host, C_size, 1e-2f, 1e-1f)) {
+            std::cout << ">>> Custom kernel test pass!" << std::endl;
+        } else {
+            std::cout << ">>> Custom kernel test fail!" << std::endl;
+            std::cout << ">>> >>First 10 elements of C_answer: \n";
+            print_first_10(C_answer, C_size);
+            std::cout << ">>> >>First 10 elements of C_host: \n";
+            print_first_10(C_host, C_size);
+        }
+
+        if (compare_cublas) {
+            if (cublasOk) {
+                cudaMemcpy(C_cublas_host, C_cublas_dev, C_size * sizeof(float), cudaMemcpyDeviceToHost);
+
+                if (validate(C_answer, C_cublas_host, C_size, 1e-2f, 1e-1f)) {
+                    std::cout << ">>> cuBLAS SGEMM test pass!" << std::endl;
+                } else {
+                    std::cout << ">>> cuBLAS SGEMM test fail!" << std::endl;
+                    std::cout << ">>> >>First 10 elements of C_answer: \n";
+                    print_first_10(C_answer, C_size);
+                    std::cout << ">>> >>First 10 elements of C_cublas_host: \n";
+                    print_first_10(C_cublas_host, C_size);
+                }
+            } else {
+                std::cout << ">>> cuBLAS verification skipped because SGEMM did not complete successfully." << std::endl;
+            }
+        }
+
+        delete[] C_answer;
+    } else if (verify) {
+        std::cout << ">>> Verification skipped because the kernel did not complete successfully." << std::endl;
+    } else {
+        std::cout << ">>> Verification skipped. Use --verify to enable it." << std::endl;
+    }
+
+    cudaFree(A_dev);
+    cudaFree(B_dev);
+    cudaFree(C_dev);
+    if (C_cublas_dev != nullptr) {
+        cudaFree(C_cublas_dev);
+    }
+
+    delete[] A_host;
+    delete[] B_host;
+    delete[] C_host;
+    delete[] C_cublas_host;
+
+    bool customOk = (launchErr == cudaSuccess && syncErr == cudaSuccess);
+    bool allOk = customOk && (!compare_cublas || cublasOk);
+    return allOk ? 0 : 1;
+}
